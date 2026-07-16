@@ -1,0 +1,884 @@
+"""Runtime orchestration for the PyQt6 ACT-R simulation."""
+
+from __future__ import annotations
+
+import contextlib
+import heapq
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pyactr as actr
+import simpy
+from PyQt6.QtCore import QTimer, Qt
+
+from gui.application import create_application
+from gui.main_window import SimulationMainWindow
+from simulation.integrations import pyactr_extension
+from simulation.runtime.pyactr_runtime_patch import install_runtime_patches
+from simulation.runtime.agent_construct import AgentConstruct
+from simulation.runtime.agent_type_factory import AgentTypeReturner
+from simulation.world.environment import Environment
+from simulation.world.factory import create_environment
+from simulation.world.human_agent import HumanAgent
+from simulation.runtime.middleman import Middleman
+from simulation.inspection.buffer_history import BufferHistoryRecorder
+from simulation.config.models import SPEED_PRESETS, SimulationConfig
+from simulation.config.settings_store import SimulationSettingsStore
+from simulation.export.history_export import SimulationHistoryExporter
+from pyactr_overrides import manager as pyactr_performance
+
+
+_TIME_EPSILON = 1e-9
+_MAX_CONSECUTIVE_ZERO_TIME_EVENTS = 1000
+
+
+class Simulation:
+    """Build agents and coordinate pausable Step, Automatic, and Jump modes."""
+
+    def __init__(self, interceptor: Any) -> None:
+        self.interceptor = interceptor
+        self.config = SimulationConfig()
+        self.agent_type_returner = AgentTypeReturner()
+        self.buffer_history = BufferHistoryRecorder()
+        self.history_exporter = SimulationHistoryExporter()
+        self.settings_store: SimulationSettingsStore | None = None
+        pyactr_extension.fix_pyactr()
+        install_runtime_patches()
+        self._devnull = open(os.devnull, "w", encoding="utf-8")
+
+        # pyactr Event.time values are absolute model times.  Keep the
+        # wrapper clock on exactly the same absolute time base.
+        self.global_sim_time = 0.0
+        self._last_global_time_delta = 0.0
+        self.agent_list: list[AgentConstruct] = []
+        self._agents_by_name: dict[str, AgentConstruct] = {}
+        self._active_agent_ids: set[int] = set()
+        self._schedule_heap: list[tuple[float, int, int, AgentConstruct]] = []
+        self._schedule_versions: dict[int, int] = {}
+        self._schedule_serial = 0
+        self.human_agent: HumanAgent | None = None
+        self.actr_environment: Any | None = None
+        self.middleman: Middleman | None = None
+        self.game_environment: Environment | None = None
+
+        self.qt_app = None
+        self.main_window: SimulationMainWindow | None = None
+        self._auto_timer: QTimer | None = None
+        self._jump_timer: QTimer | None = None
+        self._gui_notify_timer: QTimer | None = None
+        self._physics_timer: QTimer | None = None
+        self._gui_notify_pending = False
+
+        self.initialized = False
+        self.run_state = "not_started"
+        self.execution_mode = self.config.execution_mode
+        self.jumping = False
+        self.jump_target: str | None = None
+        self.jump_agent_name: str | None = None
+        self.last_error: str | None = None
+        self._mirror_config_attributes()
+
+    def __del__(self) -> None:
+        handle = getattr(self, "_devnull", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def run_simulation(self) -> int:
+        """Open the maximized GUI; the model is started from the GUI."""
+        self.qt_app = create_application(sys.argv)
+        self.settings_store = SimulationSettingsStore()
+        self.config = self.settings_store.load()
+        self.execution_mode = self.config.execution_mode
+        self._mirror_config_attributes()
+        self._auto_timer = QTimer()
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._automatic_tick)
+        self._jump_timer = QTimer()
+        self._jump_timer.setSingleShot(True)
+        self._jump_timer.timeout.connect(self._jump_tick)
+        self._gui_notify_timer = QTimer()
+        self._gui_notify_timer.setSingleShot(True)
+        self._gui_notify_timer.timeout.connect(self._flush_gui_notification)
+        self._physics_timer = QTimer()
+        self._physics_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._physics_timer.setInterval(8)
+        self._physics_timer.timeout.connect(self._physics_tick)
+
+        self.main_window = SimulationMainWindow(
+            tracer=self.interceptor,
+            simulation=self,
+        )
+        self.main_window.showMaximized()
+        return self.qt_app.exec()
+
+    def start_simulation(self, config: SimulationConfig) -> None:
+        """Build or rebuild a simulation from the complete GUI configuration."""
+        config.validate()
+        self.stop_execution()
+        if self.game_environment is not None:
+            try:
+                self.game_environment.close()
+            except Exception:
+                pass
+        self.config = config
+        pyactr_performance.configure(
+            config.experimental_pyactr_performance_boost
+        )
+        if self.settings_store is not None:
+            self.settings_store.save(config)
+        self._mirror_config_attributes()
+        self.execution_mode = config.execution_mode
+        self.global_sim_time = 0.0
+        self._last_global_time_delta = 0.0
+        self.agent_list.clear()
+        self._agents_by_name.clear()
+        self._active_agent_ids.clear()
+        self._schedule_heap.clear()
+        self._schedule_versions.clear()
+        self._schedule_serial = 0
+        self.human_agent = None
+        self.interceptor.clear()
+        self.buffer_history.clear()
+        self.agent_type_returner.clear_cache()
+        self.last_error = None
+        self.jump_target = None
+        self.jump_agent_name = None
+
+        self.actr_environment = actr.Environment(
+            focus_position=config.focus_position
+        )
+        self.middleman = Middleman(self, config.print_middleman)
+        self.agent_builder()
+        self.game_environment = create_environment(
+            config,
+            self.spatial_agents,
+            self,
+        )
+        self.middleman.set_game_environment(self.game_environment)
+
+        # Build each pyactr simulation with the real initial level frame rather
+        # than a dummy stimulus. This prevents the first environment event from
+        # overwriting current world data and makes later EmptySchedule resets
+        # reuse a valid, up-to-date frame.
+        for agent in self.agent_list:
+            agent.update_stimulus(publish=False, force=True)
+            agent.set_simulation()
+            agent.update_stimulus(publish=True)
+            self._schedule_agent(agent)
+            self.buffer_history.capture_agent(
+                agent, force=True, reason="initialization"
+            )
+
+        self.initialized = True
+        self.run_state = "running"
+        if self.main_window is not None:
+            self.main_window.set_environment(self.game_environment)
+            self.game_environment.set_gui(self.main_window.environment_view)
+        if self._physics_timer is not None and self.human_agent is not None:
+            self.game_environment._last_advance_wall = time.perf_counter()
+            self._physics_timer.start()
+        self.notify_gui()
+        if self.execution_mode == "automatic":
+            self._schedule_automatic_step()
+
+    @property
+    def spatial_agents(self) -> list[Any]:
+        """Return the two entities occupying the continuous world."""
+        entities: list[Any] = list(self.agent_list)
+        if self.human_agent is not None:
+            entities.append(self.human_agent)
+        return entities
+
+    def agent_builder(self) -> None:
+        """Build the two ACT-R/human controllers for the cooperative world."""
+        if self.actr_environment is None or self.middleman is None:
+            raise RuntimeError("The ACT-R environment has not been initialized.")
+
+        for agent_type, type_config in sorted(
+            self.config.agent_type_config.items()
+        ):
+            print_actions = type_config.print_agent_actions
+            for index in range(type_config.count):
+                name = f"{agent_type} {index + 1}"
+                # Every cognitive agent needs an independent pyACT-R visual/
+                # motor environment.  Sharing one Environment across separate
+                # SimPy schedulers causes manual-module activation events to be
+                # triggered twice as soon as both agents press keys.
+                agent_environment = actr.Environment(
+                    focus_position=self.config.focus_position
+                )
+                agent = AgentConstruct(
+                    agent_type,
+                    agent_environment,
+                    None,
+                    self.middleman,
+                    name,
+                    name,
+                    self.config.los,
+                )
+                agent.actr_time = 0.0
+                agent.print_agent_actions = print_actions
+                self.agent_list.append(agent)
+                self._agents_by_name[name] = agent
+                self._active_agent_ids.add(id(agent))
+
+        if self.config.human_agent_enabled:
+            human_name = self.config.human_agent_name.strip()
+            occupied_names = {agent.name.casefold() for agent in self.agent_list}
+            if human_name.casefold() in occupied_names:
+                raise ValueError(
+                    "The human agent name must differ from every ACT-R agent name."
+                )
+            self.human_agent = HumanAgent(human_name)
+
+        all_spatial_agents = self.spatial_agents
+        for agent in self.agent_list:
+            agent.set_agent_dictionary(all_spatial_agents)
+            identifiers = list(agent.get_agent_dictionary())
+            artifacts = self.agent_type_returner.return_agent_type(
+                agent.actr_agent_type_name,
+                agent.actr_environment,
+                identifiers,
+            )
+            if artifacts is None:
+                raise ValueError(
+                    f"Agent type '{agent.actr_agent_type_name}' is not an executable "
+                    "ACT-R model."
+                )
+            actr_construct, actr_agent, actr_adapter = artifacts
+            agent.set_actr_agent(actr_agent)
+            agent.set_actr_adapter(actr_adapter)
+            agent.set_actr_construct(actr_construct)
+
+    def set_human_control(self, key: str, pressed: bool) -> bool:
+        """Set a held WASD key for the optional human-controlled avatar."""
+        if (
+            not self.initialized
+            or self.human_agent is None
+            or self.game_environment is None
+        ):
+            return False
+        accepted = self.game_environment.set_control_key(
+            self.human_agent, key, pressed
+        )
+        if accepted and pressed:
+            shape = getattr(self.human_agent.avatar_shape, "value", "unknown")
+            self.interceptor.trace_external(
+                timestamp=self.global_sim_time,
+                agent_name=self.human_agent.name,
+                event_type="HUMAN",
+                event=f"KEY {str(key).upper()} [{shape}]",
+            )
+        return accepted
+
+    def move_human_agent(self, direction: str) -> bool:
+        """Compatibility wrapper for callers still using direction names."""
+        key = {
+            "up": "W",
+            "left": "A",
+            "down": "S",
+            "right": "D",
+        }.get(str(direction).lower())
+        if key is None:
+            return False
+        return self.set_human_control(key, True)
+
+    def restart_level(self) -> bool:
+        if not self.initialized or self.game_environment is None:
+            return False
+        self.game_environment.restart_current_level()
+        self.notify_gui(force=True)
+        return True
+
+    def _physics_tick(self) -> None:
+        if (
+            not self.initialized
+            or self.game_environment is None
+            or self.human_agent is None
+            or self.run_state not in {"running", "jumping"}
+        ):
+            return
+        changed = self.game_environment.advance_wall_clock()
+        if changed and self.main_window is not None:
+            self.main_window.environment_view.refresh()
+
+    def on_diamond_collected(self, collector: Any, diamond: Any) -> None:
+        self.interceptor.trace_external(
+            timestamp=self.global_sim_time,
+            agent_name=str(getattr(collector, "name", "Agent")),
+            event_type="WORLD",
+            event=(
+                f"DIAMOND COLLECTED {getattr(diamond, 'diamond_id', '')} "
+                f"[{getattr(diamond, 'role', 'unknown')}]"
+            ),
+        )
+        self.notify_gui(force=True)
+
+    def on_level_completed(self, level_number: int, seed: int) -> None:
+        self.interceptor.trace_external(
+            timestamp=self.global_sim_time,
+            agent_name="Environment",
+            event_type="WORLD",
+            event=f"LEVEL {level_number} COMPLETE (seed {seed})",
+        )
+
+    def on_level_started(self, level_number: int, seed: int) -> None:
+        self.interceptor.trace_external(
+            timestamp=self.global_sim_time,
+            agent_name="Environment",
+            event_type="WORLD",
+            event=f"LEVEL {level_number} STARTED (seed {seed})",
+        )
+        self.notify_gui(force=True)
+
+    def on_level_restarted(self, level_number: int, seed: int) -> None:
+        self.interceptor.trace_external(
+            timestamp=self.global_sim_time,
+            agent_name="Environment",
+            event_type="WORLD",
+            event=f"LEVEL {level_number} RESTARTED (seed {seed})",
+        )
+        self.notify_gui(force=True)
+
+    def set_execution_mode(self, mode: str) -> None:
+        """Switch live between Step and Automatic execution."""
+        if mode not in {"single", "automatic"}:
+            raise ValueError(f"Unknown execution mode: {mode}")
+        self.execution_mode = mode
+        self.config.execution_mode = mode
+        if self._auto_timer is not None:
+            self._auto_timer.stop()
+        if (
+            self.initialized
+            and self.run_state == "running"
+            and mode == "automatic"
+        ):
+            self._schedule_automatic_step()
+        self.notify_gui()
+
+    def set_speed_factor(self, speed_factor: float) -> None:
+        allowed = {value for _, value in SPEED_PRESETS}
+        if float(speed_factor) not in allowed:
+            raise ValueError("Unknown speed preset.")
+        self.speed_factor = float(speed_factor)
+        self.config.speed_factor = float(speed_factor)
+        if (
+            self.initialized
+            and self.run_state == "running"
+            and self.execution_mode == "automatic"
+        ):
+            if self._auto_timer is not None:
+                self._auto_timer.stop()
+            self._schedule_automatic_step()
+
+    def pause(self) -> None:
+        """Pause Automatic execution or cancel an active production jump."""
+        if not self.initialized:
+            return
+        if self._auto_timer is not None:
+            self._auto_timer.stop()
+        if self._jump_timer is not None:
+            self._jump_timer.stop()
+        if self._physics_timer is not None:
+            self._physics_timer.stop()
+        self.jumping = False
+        self.run_state = "paused"
+        self.notify_gui()
+
+    def resume(self) -> None:
+        """Resume using the currently selected execution mode."""
+        if not self.initialized or not self.agent_list:
+            return
+        self.run_state = "running"
+        self.jumping = False
+        if self._physics_timer is not None and self.human_agent is not None:
+            if self.game_environment is not None:
+                self.game_environment._last_advance_wall = time.perf_counter()
+            self._physics_timer.start()
+        if self.execution_mode == "automatic":
+            self._schedule_automatic_step()
+        self.notify_gui()
+
+    def stop_execution(self) -> None:
+        if self._auto_timer is not None:
+            self._auto_timer.stop()
+        if self._jump_timer is not None:
+            self._jump_timer.stop()
+        if self._physics_timer is not None:
+            self._physics_timer.stop()
+        self.jumping = False
+        if self.initialized:
+            self.run_state = "stopped"
+        if self.game_environment is not None:
+            try:
+                self.game_environment.close()
+            except Exception:
+                pass
+
+    def step_once(self, *, force: bool = False) -> bool:
+        """Execute one visible cognitive event."""
+        if not self.initialized or not self.agent_list:
+            return False
+        if not force and (
+            self.run_state != "running" or self.execution_mode != "single"
+        ):
+            return False
+        return self._execute_next_event() is not None
+
+    def _schedule_automatic_step(self) -> None:
+        if (
+            not self.initialized
+            or self.run_state != "running"
+            or self.execution_mode != "automatic"
+            or self.jumping
+            or not self.agent_list
+            or self._auto_timer is None
+        ):
+            return
+
+        if float(self.speed_factor) == -1.0:
+            self._auto_timer.start(0)
+            return
+        # The previous visible event already established how far the shared
+        # model clock advanced.  Delaying by that delta avoids treating an
+        # absolute timestamp as a duration and lets lagging agents catch up
+        # without adding artificial wall-clock time.
+        delay = max(0.0, float(self._last_global_time_delta))
+        factor = 100.0 / float(self.speed_factor)
+        milliseconds = max(1, round(delay * factor * 1000))
+        self._auto_timer.start(milliseconds)
+
+    def _automatic_tick(self) -> None:
+        if self.run_state != "running" or self.execution_mode != "automatic":
+            return
+        if float(self.speed_factor) == -1.0:
+            deadline = time.perf_counter() + 0.010
+            processed = 0
+            while (
+                self.agent_list
+                and self.run_state == "running"
+                and time.perf_counter() < deadline
+                and processed < 128
+            ):
+                if self._execute_next_event(notify=False) is None and not self.agent_list:
+                    break
+                processed += 1
+            self.notify_gui()
+        else:
+            self._execute_next_event()
+        if not self.agent_list:
+            self.run_state = "finished"
+            self.notify_gui(force=True)
+            return
+        self._schedule_automatic_step()
+
+    def _execute_next_event(
+        self, *, notify: bool = True
+    ) -> tuple[AgentConstruct, Any] | None:
+        if not self.agent_list:
+            self.run_state = "finished"
+            self.notify_gui()
+            return None
+
+        assert self.middleman is not None
+        # Schedule by the next event already queued inside each independent
+        # pyactr/SimPy environment. A versioned heap avoids sorting every agent
+        # before every visible event.
+        agent = self._pop_scheduled_agent()
+        if agent is None:
+            self._rebuild_schedule()
+            agent = self._pop_scheduled_agent()
+        if agent is None:
+            self.run_state = "finished"
+            if notify:
+                self.notify_gui(force=True)
+            return None
+        previous_agent_time = float(agent.actr_time)
+        previous_global_time = float(self.global_sim_time)
+        # Publish the frame of the agent that is about to step.  Each model has
+        # its own pyACT-R environment, so visual and manual-module events remain
+        # isolated while both models share the same physical world.
+        agent.update_stimulus(publish=True)
+
+        try:
+            with self.suppress_stdout():
+                agent.simulation.step()
+            event = agent.simulation.current_event
+            if event is None:
+                raise RuntimeError(
+                    f"{agent.name} did not produce an ACT-R event."
+                )
+
+            # ``Event.time`` and ``Simulation.show_time()`` are absolute
+            # pyactr/SimPy timestamps.  The old runtime added that absolute
+            # value to ``actr_time`` on every event, producing quadratic time
+            # inflation.  show_time() is authoritative; Event.time is retained
+            # as a compatibility fallback.
+            try:
+                event_time = float(agent.simulation.show_time())
+            except (AttributeError, TypeError, ValueError):
+                event_time = float(getattr(event, "time", previous_agent_time))
+
+            if event_time < previous_agent_time - _TIME_EPSILON:
+                raise RuntimeError(
+                    f"{agent.name} ACT-R time moved backwards from "
+                    f"{previous_agent_time:g} to {event_time:g}."
+                )
+
+            agent_delta = max(0.0, event_time - previous_agent_time)
+            if agent_delta > _TIME_EPSILON:
+                agent.no_increase_count = 0
+            else:
+                agent.no_increase_count = (
+                    getattr(agent, "no_increase_count", 0) + 1
+                )
+
+            # Several normal pyactr events may occur at the same timestamp.
+            # Keep a high guard against a genuinely non-advancing event loop
+            # without terminating valid conflict-resolution/buffer clusters.
+            if agent.no_increase_count >= _MAX_CONSECUTIVE_ZERO_TIME_EVENTS:
+                self.last_error = (
+                    f"{agent.name} produced "
+                    f"{_MAX_CONSECUTIVE_ZERO_TIME_EVENTS} consecutive "
+                    "events without advancing ACT-R time."
+                )
+                self._remove_agent(agent)
+                if not self.agent_list:
+                    self.run_state = "finished"
+                if notify:
+                    self.notify_gui(force=True)
+                return None
+
+            agent.actr_time = event_time
+            # Agents run on independent absolute pyactr clocks.  The shared
+            # elapsed model time is the furthest local clock reached, not the
+            # sum of event timestamps.
+            self.global_sim_time = max(self.global_sim_time, event_time)
+            self._last_global_time_delta = max(
+                0.0, self.global_sim_time - previous_global_time
+            )
+            # Without a human player the physics world follows ACT-R model
+            # time. Human sessions use the precise GUI timer instead, avoiding
+            # double integration while preserving responsive keyboard control.
+            if (
+                self.game_environment is not None
+                and self.human_agent is None
+                and self._last_global_time_delta > 0.0
+            ):
+                self.game_environment.advance(self._last_global_time_delta)
+            agent.actr_extension()
+            if agent.print_agent_actions:
+                print(f"{agent.name}, {agent.actr_time}, {event}")
+            key = pyactr_extension.key_pressed(agent)
+            if key:
+                self.middleman.motor_input(key, agent)
+
+            self.interceptor.trace(agent, event)
+            self.buffer_history.capture_agent(
+                agent, event=event, reason="event"
+            )
+            self._schedule_agent(agent)
+            if notify:
+                self.notify_gui()
+            return agent, event
+
+        except (
+            simpy.core.EmptySchedule,
+            AttributeError,
+            IndexError,
+            RuntimeError,
+            TypeError,
+        ) as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            try:
+                agent.handle_empty_schedule()
+                self.buffer_history.capture_agent(
+                    agent,
+                    force=True,
+                    reason="schedule_reset",
+                )
+            except Exception as reset_exc:
+                self.last_error = (
+                    f"{self.last_error}; reset failed: "
+                    f"{type(reset_exc).__name__}: {reset_exc}"
+                )
+                if agent in self.agent_list:
+                    self._remove_agent(agent)
+                if not self.agent_list:
+                    self.run_state = "finished"
+            else:
+                self._schedule_agent(agent)
+            if notify:
+                self.notify_gui(force=True)
+            return None
+
+    @staticmethod
+    def _next_scheduled_time(agent: AgentConstruct) -> float:
+        simulation = getattr(agent, "simulation", None)
+        if simulation is None:
+            return float("inf")
+        peek = getattr(simulation, "peek_next_event_time", None)
+        if callable(peek):
+            try:
+                return float(peek())
+            except Exception:
+                pass
+        environment = getattr(simulation, "_Simulation__simulation", None)
+        try:
+            return float(environment.peek())
+        except Exception:
+            return float("inf")
+
+    def _schedule_agent(self, agent: AgentConstruct) -> None:
+        if id(agent) not in self._active_agent_ids:
+            return
+        identifier = id(agent)
+        version = self._schedule_versions.get(identifier, 0) + 1
+        self._schedule_versions[identifier] = version
+        self._schedule_serial += 1
+        heapq.heappush(
+            self._schedule_heap,
+            (
+                self._next_scheduled_time(agent),
+                self._schedule_serial,
+                version,
+                agent,
+            ),
+        )
+
+    def _pop_scheduled_agent(self) -> AgentConstruct | None:
+        while self._schedule_heap:
+            _time, _serial, version, agent = heapq.heappop(
+                self._schedule_heap
+            )
+            identifier = id(agent)
+            if identifier not in self._active_agent_ids:
+                continue
+            if self._schedule_versions.get(identifier) != version:
+                continue
+            return agent
+        return None
+
+    def _rebuild_schedule(self) -> None:
+        self._schedule_heap.clear()
+        for agent in self.agent_list:
+            self._schedule_agent(agent)
+
+    def _remove_agent(self, agent: AgentConstruct) -> None:
+        if agent in self.agent_list:
+            self.agent_list.remove(agent)
+        identifier = id(agent)
+        self._active_agent_ids.discard(identifier)
+        self._schedule_versions.pop(identifier, None)
+        name = str(getattr(agent, "name", ""))
+        if self._agents_by_name.get(name) is agent:
+            self._agents_by_name.pop(name, None)
+        if self.game_environment is not None:
+            self.game_environment.remove_agent_from_game(agent)
+
+    def start_jump(
+        self, production_name: str, agent_name: str | None = None
+    ) -> None:
+        """Run UI-friendly microsteps until the requested production fires."""
+        target = production_name.strip()
+        if not self.initialized or not target or not self.agent_list:
+            return
+        if self._auto_timer is not None:
+            self._auto_timer.stop()
+        self.jumping = True
+        self.jump_target = target
+        self.jump_agent_name = agent_name
+        self.run_state = "jumping"
+        self.last_error = None
+        if self._jump_timer is not None:
+            self._jump_timer.start(0)
+        self.notify_gui()
+
+    def _jump_tick(self) -> None:
+        if not self.jumping:
+            return
+        if not self.agent_list:
+            self._finish_jump(found=False, finished=True)
+            return
+
+        before = len(self.interceptor.records)
+        self._execute_next_event()
+        new_records = self.interceptor.records[before:]
+        for record in new_records:
+            if (
+                self.jump_agent_name
+                and record.get("agent_name") != self.jump_agent_name
+            ):
+                continue
+            if self._record_matches_production(
+                record, self.jump_target or ""
+            ):
+                self._finish_jump(found=True)
+                return
+        if not self.agent_list:
+            self._finish_jump(found=False, finished=True)
+            return
+        if self.jumping and self._jump_timer is not None:
+            self._jump_timer.start(0)
+
+    def _finish_jump(
+        self, *, found: bool, finished: bool = False
+    ) -> None:
+        self.jumping = False
+        self.run_state = "finished" if finished else "paused"
+        if found:
+            self.last_error = None
+        elif finished:
+            self.last_error = (
+                "The simulation ended before the requested production fired."
+            )
+        else:
+            self.last_error = (
+                "The production jump stopped before the target was reached."
+            )
+        self.notify_gui()
+
+    @staticmethod
+    def _record_matches_production(
+        record: dict[str, Any], target: str
+    ) -> bool:
+        if str(record.get("type", "")).upper() != "PROCEDURAL":
+            return False
+        event = str(record.get("event", "")).strip()
+        prefix = "RULE FIRED:"
+        fired = (
+            event[len(prefix) :].strip()
+            if event.upper().startswith(prefix)
+            else event
+        )
+        return fired.casefold() == target.strip().casefold()
+
+    def get_production_names(self, agent_name: str | None = None) -> list[str]:
+        """Return production names globally or for one selected runtime agent."""
+        names: set[str] = set()
+        for agent in self.agent_list:
+            if agent_name and str(getattr(agent, "name", "")) != agent_name:
+                continue
+            productions = getattr(
+                getattr(agent, "actr_agent", None), "productions", None
+            )
+            try:
+                names.update(str(name) for name in productions.keys())
+            except AttributeError:
+                continue
+        return sorted(names, key=str.lower)
+
+    def save_settings(self, config: SimulationConfig | None = None) -> None:
+        """Persist controls without rewriting a running simulation's build state."""
+        payload = config or self.config
+        if not self.initialized and config is not None:
+            self.config = config
+            self.execution_mode = config.execution_mode
+            self._mirror_config_attributes()
+        if self.settings_store is not None:
+            self.settings_store.save(payload)
+
+    def reset_settings(self) -> SimulationConfig:
+        config = (
+            self.settings_store.reset()
+            if self.settings_store is not None
+            else SimulationConfig()
+        )
+        if not self.initialized:
+            self.config = config
+            self.execution_mode = config.execution_mode
+            self._mirror_config_attributes()
+        return config
+
+    def get_agent_by_name(self, agent_name: str) -> AgentConstruct | None:
+        return self._agents_by_name.get(str(agent_name))
+
+    def replace_agent_buffer_from_string(
+        self, agent_name: str, buffer_name: str, chunk_string: str
+    ) -> None:
+        agent = self.get_agent_by_name(agent_name)
+        if agent is None:
+            raise KeyError(f"Unknown agent: {agent_name}")
+        chunk = pyactr_extension.chunk_from_string(chunk_string)
+        pyactr_extension.replace_buffer(agent, buffer_name, chunk)
+        self.buffer_history.capture_agent(
+            agent, reason="manual_buffer_update"
+        )
+        self.last_error = None
+        self.notify_gui()
+
+    def export_history(self, path: str | Path) -> Path:
+        if not self.initialized:
+            raise RuntimeError("No simulation has been started yet.")
+        for agent in self.agent_list:
+            self.buffer_history.capture_agent(agent, reason="export")
+        return self.history_exporter.export(path, self)
+
+    def notify_gui(self, *, force: bool = False) -> None:
+        if self.main_window is None:
+            return
+        automatic = (
+            not force
+            and self.execution_mode == "automatic"
+            and self.run_state == "running"
+            and self._gui_notify_timer is not None
+        )
+        if automatic:
+            self._gui_notify_pending = True
+            if not self._gui_notify_timer.isActive():
+                self._gui_notify_timer.start(33)
+            return
+        self._emit_gui_refresh()
+
+    def _flush_gui_notification(self) -> None:
+        if not self._gui_notify_pending:
+            return
+        self._gui_notify_pending = False
+        self._emit_gui_refresh()
+
+    def _emit_gui_refresh(self) -> None:
+        if self.main_window is None:
+            return
+        signal = getattr(self.main_window, "refresh_requested", None)
+        if signal is not None:
+            signal.emit()
+        else:
+            self.main_window.refresh()
+
+    def _mirror_config_attributes(self) -> None:
+        """Keep the public settings from the original Simulation API available."""
+        self.focus_position = self.config.focus_position
+        self.print_middleman = self.config.print_middleman
+        self.width = self.config.width
+        self.height = self.config.height
+        self.speed_factor = self.config.speed_factor
+        self.print_agent_actions = self.config.print_agent_actions
+        self.experimental_pyactr_performance_boost = (
+            self.config.experimental_pyactr_performance_boost
+        )
+        self.los = self.config.los
+        self.stepper = self.config.stepper
+        self.human_agent_enabled = self.config.human_agent_enabled
+        self.human_agent_name = self.config.human_agent_name
+        self.environment_mode = self.config.environment_mode
+        self.virtual_level = self.config.virtual_level
+        self.agent_type_config = {
+            name: value.to_dict()
+            for name, value in self.config.agent_type_config.items()
+        }
+
+    @contextlib.contextmanager
+    def suppress_stdout(self):
+        """Suppress optional pyactr prints without reopening os.devnull per event."""
+        old_stdout = sys.stdout
+        sys.stdout = self._devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
